@@ -1,0 +1,605 @@
+# CIEL /0 — Maximal 2D Coupled Simulation Suite
+# ΞA (structured vacuum), FⱮ (aether), uⱮ (CSF), Quantum Microtubule Network,
+# Λ0 safety kernel, ψ_life functional, PID control, logging, spectra, coherence, animation.
+# Author: Adrian Lipa (structure aligned with CIEL /0 vision)
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, Any, Optional
+import csv
+import time
+
+# =========================
+# Reproducibility
+# =========================
+def set_seed(seed: int = 42):
+    np.random.seed(seed)
+
+# =========================
+# Numeric utilities
+# =========================
+def laplacian_2d(arr, dx, dy, bc="periodic"):
+    if bc == "periodic":
+        return ((np.roll(arr, -1, 0) - 2 * arr + np.roll(arr, 1, 0)) / dy**2 +
+                (np.roll(arr, -1, 1) - 2 * arr + np.roll(arr, 1, 1)) / dx**2)
+    elif bc == "neumann":
+        up = np.vstack([arr[0:1, :], arr[:-1, :]])
+        down = np.vstack([arr[1:, :], arr[-1:, :]])
+        left = np.hstack([arr[:, 0:1], arr[:, :-1]])
+        right = np.hstack([arr[:, 1:], arr[:, -1:]])
+        return ((up - 2 * arr + down) / dy**2 + (left - 2 * arr + right) / dx**2)
+    else:
+        raise ValueError("Unsupported BC")
+
+def grad_2d(arr, dx, dy, bc="periodic"):
+    if bc == "periodic":
+        d_dx = (np.roll(arr, -1, 1) - np.roll(arr, 1, 1)) / (2 * dx)
+        d_dy = (np.roll(arr, -1, 0) - np.roll(arr, 1, 0)) / (2 * dy)
+    else:
+        d_dx = np.zeros_like(arr)
+        d_dy = np.zeros_like(arr)
+        d_dx[:, 1:-1] = (arr[:, 2:] - arr[:, :-2]) / (2 * dx)
+        d_dx[:, 0] = (arr[:, 1] - arr[:, 0]) / dx
+        d_dx[:, -1] = (arr[:, -1] - arr[:, -2]) / dx
+        d_dy[1:-1, :] = (arr[2:, :] - arr[:-2, :]) / (2 * dy)
+        d_dy[0, :] = (arr[1, :] - arr[0, :]) / dy
+        d_dy[-1, :] = (arr[-1, :] - arr[-2, :]) / dy
+    return d_dx, d_dy
+
+def div_2d(Fx, Fy, dx, dy, bc="periodic"):
+    dFx_dx, _ = grad_2d(Fx, dx, dy, bc)
+    _, dFy_dy = grad_2d(Fy, dx, dy, bc)
+    return dFx_dx + dFy_dy
+
+def curlz_2d(Fx, Fy, dx, dy, bc="periodic"):
+    dFy_dx, _ = grad_2d(Fy, dx, dy, bc)
+    _, dFx_dy = grad_2d(Fx, dx, dy, bc)
+    return dFy_dx - dFx_dy
+
+def spectral_filter(arr, kcut_frac=0.5):
+    Ny, Nx = arr.shape
+    A = np.fft.rfft2(arr)
+    ky = np.fft.fftfreq(Ny)[:, None]
+    kx = np.fft.rfftfreq(Nx)[None, :]
+    k = np.sqrt(ky**2 + kx**2)
+    mask = (k <= kcut_frac * np.max(k))
+    A *= mask
+    return np.fft.irfft2(A, s=arr.shape)
+
+def running_mean(x, n):
+    if n <= 1:
+        return x
+    cumsum = np.cumsum(np.insert(x, 0, 0))
+    res = (cumsum[n:] - cumsum[:-n]) / float(n)
+    return np.concatenate([x[:n - 1], res])
+
+# =========================
+# Config
+# =========================
+@dataclass
+class SimConfig:
+    Nx: int = 160
+    Ny: int = 160
+    Lx: float = 0.02
+    Ly: float = 0.02
+    bc: str = "periodic"
+    dt: float = 2e-5
+    steps: int = 12000
+    save_every: int = 10
+    tau_A: float = 0.015
+    ell_A: float = 0.0012
+    sigma_A: float = 3e-4
+    OU_tau: float = 0.003
+    OU_gain: float = 1.0
+    D_F: float = 0.0008
+    omega_F: float = 1.8
+    sigma_F: float = 1.5e-4
+    rho_csf: float = 1000.0
+    gamma_csf: float = 0.5
+    eta_csf: float = 0.04
+    kappa_csf: float = 0.0
+    force_amp_base: float = 8e-4
+    resp_freq: float = 0.25
+    card_freq: float = 1.0
+    resp_phase: float = 0.0
+    card_phase: float = np.pi / 3
+    spatial_gauss_sigma: float = 0.004
+    gauss_centers: Tuple[Tuple[float, float], ...] = ((0.006, 0.006), (0.014, 0.014))
+    qNx: int = 40
+    qNy: int = 40
+    g_A: float = 0.03
+    g_u: float = 0.06
+    lindblad_gamma_down: float = 0.02
+    lindblad_gamma_phi: float = 0.01
+    lindblad_gamma_up: float = 0.005
+    J_neighbor: float = 0.01
+    mu0: float = 4 * np.pi * 1e-7
+    c: float = 3e8
+    alpha_res: float = 1.0
+    beta: float = 0.08
+    B0: float = 4e-10
+    rho_med: float = 1000.0
+    L_char: float = 0.008
+    w_grad_u: float = 0.35
+    w_grad_phi: float = 0.35
+    w_curlF: float = 0.2
+    w_amp_u: float = 0.05
+    w_amp_phi: float = 0.05
+    psi_floor: float = 0.38
+    pid_kp: float = 0.6
+    pid_ki: float = 0.1
+    pid_kd: float = 0.05
+    ctrl_min_amp: float = 1e-5
+    ctrl_max_amp: float = 1.5e-3
+    make_animation: bool = True
+    frame_stride: int = 10
+    downsample_curves: int = 5
+    csv_metrics_path: Optional[str] = None
+    seed: int = 7
+    
+# =========================
+# Fields
+# =========================
+class PhiAField2D:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self.dx = cfg.Lx / cfg.Nx
+        self.dy = cfg.Ly / cfg.Ny
+        self.state = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+        self.ou_state = np.zeros_like(self.state)
+
+    def step(self, dt):
+        d_ou = (-self.ou_state / self.cfg.OU_tau +
+                np.random.normal(scale=self.cfg.sigma_A, size=self.state.shape)) * self.cfg.OU_gain
+        self.ou_state += dt * d_ou
+        lap = laplacian_2d(self.state, self.dx, self.dy, self.cfg.bc)
+        dphi = (-self.state + self.cfg.ell_A**2 * lap + self.ou_state) / self.cfg.tau_A
+        self.state += dt * dphi
+        return self.state
+
+class AetherField2D:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self.dx = cfg.Lx / cfg.Nx
+        self.dy = cfg.Ly / cfg.Ny
+        self.Fx = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+        self.Fy = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+
+    def step(self, dt):
+        lapFx = laplacian_2d(self.Fx, self.dx, self.dy, self.cfg.bc)
+        lapFy = laplacian_2d(self.Fy, self.dx, self.dy, self.cfg.bc)
+        nFx = np.random.normal(scale=self.cfg.sigma_F, size=self.Fx.shape)
+        nFy = np.random.normal(scale=self.cfg.sigma_F, size=self.Fy.shape)
+        dFx = self.cfg.D_F * lapFx - (self.cfg.omega_F**2) * self.Fx + nFx
+        dFy = self.cfg.D_F * lapFy - (self.cfg.omega_F**2) * self.Fy + nFy
+        self.Fx += dt * dFx
+        self.Fy += dt * dFy
+        return self.Fx, self.Fy
+
+class CSFField2D:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self.dx = cfg.Lx / cfg.Nx
+        self.dy = cfg.Ly / cfg.Ny
+        self.u_x = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+        self.u_y = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+        self.v_x = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+        self.v_y = np.zeros((cfg.Ny, cfg.Nx), dtype=float)
+
+    def step(self, dt, f_x, f_y):
+        lap_ux = laplacian_2d(self.u_x, self.dx, self.dy, self.cfg.bc)
+        lap_uy = laplacian_2d(self.u_y, self.dx, self.dy, self.cfg.bc)
+        acc_x = (f_x - self.cfg.gamma_csf * self.v_x + self.cfg.eta_csf * lap_ux - self.cfg.kappa_csf * self.u_x) / self.cfg.rho_csf
+        acc_y = (f_y - self.cfg.gamma_csf * self.v_y + self.cfg.eta_csf * lap_uy - self.cfg.kappa_csf * self.u_y) / self.cfg.rho_csf
+        self.v_x += dt * acc_x
+        self.v_y += dt * acc_y
+        self.u_x += dt * self.v_x
+        self.u_y += dt * self.v_y
+        return self.u_x, self.u_y
+
+# =========================
+# Quantum Microtubule Network (2x2 density per site, multiple Lindblad channels)
+# =========================
+class MicrotubuleQNet:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self.qNx = cfg.qNx
+        self.qNy = cfg.qNy
+        self.H0 = np.array([[0, 1], [1, 0]], dtype=complex)
+        self.Z = np.array([[1, 0], [0, -1]], dtype=complex)
+        self.I2 = np.eye(2, dtype=complex)
+        self.rho = np.zeros((self.qNy, self.qNx, 2, 2), dtype=complex)
+        self.rho[:, :, 0, 0] = 1.0
+        self.L_down = np.sqrt(cfg.lindblad_gamma_down) * np.array([[0, 1], [0, 0]], dtype=complex)
+        self.L_up = np.sqrt(cfg.lindblad_gamma_up) * np.array([[0, 0], [1, 0]], dtype=complex)
+        self.L_phi = np.sqrt(cfg.lindblad_gamma_phi) * self.Z
+
+    def block_average(self, field):
+        Ny, Nx = field.shape
+        by = Ny // self.qNy
+        bx = Nx // self.qNx
+        trimmed = field[:by * self.qNy, :bx * self.qNx]
+        reshaped = trimmed.reshape(self.qNy, by, self.qNx, bx)
+        return reshaped.mean(axis=(1, 3))
+
+    def neighbor_mean_field(self, observable: np.ndarray) -> np.ndarray:
+        up = np.roll(observable, 1, axis=0)
+        down = np.roll(observable, -1, axis=0)
+        left = np.roll(observable, 1, axis=1)
+        right = np.roll(observable, -1, axis=1)
+        return 0.25 * (up + down + left + right)
+
+    def lindblad_step(self, dt, PhiA_field, u_x, u_y):
+        Phi = self.block_average(PhiA_field)
+        Ux = self.block_average(u_x)
+        Uy = self.block_average(u_y)
+        Ueff = np.sign(Ux) * np.sqrt(Ux**2 + Uy**2)
+        Zexp = np.zeros((self.qNy, self.qNx), dtype=float)
+        for j in range(self.qNy):
+            for i in range(self.qNx):
+                rho = self.rho[j, i]
+                Zexp[j, i] = float(np.real(np.trace(rho @ self.Z)))
+        Zmf = self.neighbor_mean_field(Zexp)
+
+        for j in range(self.qNy):
+            for i in range(self.qNx):
+                H_eff = (self.H0 +
+                         self.cfg.g_A * Phi[j, i] * self.I2 +
+                         self.cfg.g_u * Ueff[j, i] * self.Z +
+                         self.cfg.J_neighbor * Zmf[j, i] * self.Z)
+                rho = self.rho[j, i]
+                comm = -1j * (H_eff @ rho - rho @ H_eff)
+                diss = 0.0
+                for L in (self.L_down, self.L_up, self.L_phi):
+                    diss += L @ rho @ L.conj().T - 0.5 * (L.conj().T @ L @ rho + rho @ L.conj().T @ L)
+                rho_new = rho + dt * (comm + diss)
+                rho_new = 0.5 * (rho_new + rho_new.conj().T)
+                tr = np.trace(rho_new)
+                if np.abs(tr) > 1e-14:
+                    rho_new /= tr
+                self.rho[j, i] = rho_new
+
+    def purity_map(self):
+        pur = np.zeros((self.qNy, self.qNx), dtype=float)
+        for j in range(self.qNy):
+            for i in range(self.qNx):
+                rho = self.rho[j, i]
+                pur[j, i] = float(np.real(np.trace(rho @ rho)))
+        return pur
+
+    def entropy_map(self):
+        s = np.zeros((self.qNy, self.qNx), dtype=float)
+        for j in range(self.qNy):
+            for i in range(self.qNx):
+                rho = self.rho[j, i]
+                vals = np.linalg.eigvalsh(rho)
+                vals = np.clip(vals, 1e-12, 1.0)
+                s[j, i] = float(-np.sum(vals * np.log(vals)))
+        return s
+
+    def mean_purity(self): return float(np.mean(self.purity_map()))
+    def mean_entropy(self): return float(np.mean(self.entropy_map()))
+
+# =========================
+# Λ0 kernel and ψ_life with PID controller
+# =========================
+class Lambda0Kernel:
+    def __init__(self, cfg: SimConfig, dx: float, dy: float):
+        self.cfg = cfg
+        self.dx = dx
+        self.dy = dy
+        self.pid_int = 0.0
+        self.pid_prev_err = 0.0
+
+    def lambda0_field(self, Fx, Fy):
+        divF = div_2d(Fx, Fy, self.dx, self.dy, self.cfg.bc)
+        curlF = curlz_2d(Fx, Fy, self.dx, self.dy, self.cfg.bc)
+        term1 = (self.cfg.B0**2) / (self.cfg.mu0 * self.cfg.rho_med * self.cfg.c**2 * self.cfg.L_char**2) * self.cfg.alpha_res
+        lam = term1 + self.cfg.beta * (divF**2 - curlF**2)
+        return lam, divF, curlF
+
+    def psi_life(self, u_x, u_y, phiA, curlF):
+        dux_dx, dux_dy = grad_2d(u_x, self.dx, self.dy, self.cfg.bc)
+        duy_dx, duy_dy = grad_2d(u_y, self.dx, self.dy, self.cfg.bc)
+        dphix, dphiy = grad_2d(phiA, self.dx, self.dy, self.cfg.bc)
+        grad_u = np.sqrt(dux_dx**2 + dux_dy**2 + duy_dx**2 + duy_dy**2)
+        grad_phi = np.sqrt(dphix**2 + dphiy**2)
+
+        def norm_med(x):
+            return x / (np.median(np.abs(x)) + 1e-9)
+
+        gu = norm_med(grad_u)
+        gp = norm_med(grad_phi)
+        cf = norm_med(np.abs(curlF))
+        amp_u = norm_med(np.sqrt(u_x**2 + u_y**2))
+        amp_phi = norm_med(np.abs(phiA))
+
+        health = (
+            self.cfg.w_grad_u * np.exp(-gu) +
+            self.cfg.w_grad_phi * np.exp(-gp) +
+            self.cfg.w_curlF * np.exp(-cf) +
+            self.cfg.w_amp_u * np.exp(-amp_u) +
+            self.cfg.w_amp_phi * np.exp(-amp_phi)
+        )
+        return float(np.clip(np.mean(health), 0.0, 1.0))
+
+    def pid_update(self, psi, amp):
+        err = psi - self.cfg.psi_floor
+        self.pid_int += err
+        d_err = err - self.pid_prev_err
+        self.pid_prev_err = err
+        delta = self.cfg.pid_kp * err + self.cfg.pid_ki * self.pid_int + self.cfg.pid_kd * d_err
+        new_amp = np.clip(amp + delta, self.cfg.ctrl_min_amp, self.cfg.ctrl_max_amp)
+        return float(new_amp)
+
+    def spatial_mask(self, phiA, u_mag):
+        dphix, dphiy = grad_2d(phiA, self.dx, self.dy, self.cfg.bc)
+        gphi = np.sqrt(dphix**2 + dphiy**2)
+        gphi_n = gphi / (np.percentile(gphi, 90) + 1e-9)
+        u_n = u_mag / (np.percentile(u_mag, 90) + 1e-9)
+        mask = np.exp(-0.5 * (gphi_n + u_n))
+        return mask
+
+# =========================
+# Forcing model (respiration + cardiac + spatial Gaussians)
+# =========================
+def gaussian_2d(Nx, Ny, Lx, Ly, cx, cy, sigma):
+    x = np.linspace(0, Lx, Nx)
+    y = np.linspace(0, Ly, Ny)
+    X, Y = np.meshgrid(x, y)
+    return np.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * sigma**2))
+
+class ForcingField:
+    def __init__(self, cfg: SimConfig, dx: float, dy: float):
+        self.cfg = cfg
+        self.dx = dx
+        self.dy = dy
+        self.templates = []
+        for (cx, cy) in cfg.gauss_centers:
+            self.templates.append(gaussian_2d(cfg.Nx, cfg.Ny, cfg.Lx, cfg.Ly, cx, cy, cfg.spatial_gauss_sigma))
+        self.templates = np.array(self.templates)
+
+    def compose(self, t, amp, mask=None):
+        resp = np.sin(2 * np.pi * self.cfg.resp_freq * t + self.cfg.resp_phase)
+        card = np.sin(2 * np.pi * self.cfg.card_freq * t + self.cfg.card_phase)
+        temporal = 0.6 * resp + 0.4 * card
+        spatial = np.sum(self.templates, axis=0)
+        field = amp * temporal * spatial
+        if mask is not None:
+            field *= mask
+        gx, gy = grad_2d(spatial, self.dx, self.dy, self.cfg.bc)
+        norm = np.sqrt(gx**2 + gy**2) + 1e-9
+        fx = field * (gx / norm)
+        fy = field * (gy / norm)
+        return fx, fy
+
+# =========================
+# Metrics: coherence and spectra
+# =========================
+def cross_coherence(a, b):
+    a0 = a - np.mean(a)
+    b0 = b - np.mean(b)
+    num = np.sum(a0 * b0)
+    den = np.sqrt(np.sum(a0 * a0) * np.sum(b0 * b0)) + 1e-12
+    return float(np.clip(num / den, -1.0, 1.0))
+
+def spectrum_1d(x):
+    X = np.fft.rfft(x - np.mean(x))
+    psd = np.abs(X)**2
+    return psd
+
+# =========================
+# Orchestrator
+# =========================
+class CIEL2DMax:
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        set_seed(cfg.seed)
+        self.dx = cfg.Lx / cfg.Nx
+        self.dy = cfg.Ly / cfg.Ny
+        self.phiA = PhiAField2D(cfg)
+        self.aether = AetherField2D(cfg)
+        self.csf = CSFField2D(cfg)
+        self.qnet = MicrotubuleQNet(cfg)
+        self.guard = Lambda0Kernel(cfg, self.dx, self.dy)
+        self.forcing = ForcingField(cfg, self.dx, self.dy)
+        self.amp = cfg.force_amp_base
+        self.purity_hist = []
+        self.entropy_hist = []
+        self.lambda_hist = []
+        self.psi_hist = []
+        self.coh_hist = []
+        self.amp_hist = []
+        self.time_axis = []
+        self.csv_writer = None
+        if cfg.csv_metrics_path:
+            self.csv_file = open(cfg.csv_metrics_path, "w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            header = ["step", "t", "purity", "entropy", "lambda_mean", "psi_life", "coh_u_phi", "amp"]
+            self.csv_writer.writerow(header)
+
+    def __del__(self):
+        try:
+            if self.csv_writer is not None:
+                self.csv_file.close()
+        except Exception:
+            pass
+
+    def step(self, step_idx):
+        t = step_idx * self.cfg.dt
+        # evolve fields
+        phi = self.phiA.step(self.cfg.dt)
+        Fx, Fy = self.aether.step(self.cfg.dt)
+        # safety - aware mask
+        u_mag_curr = np.sqrt(self.csf.u_x**2 + self.csf.u_y**2)
+        mask = self.guard.spatial_mask(phi, u_mag_curr)
+        # forcing
+        f_x, f_y = self.forcing.compose(t, self.amp, mask=mask)
+        u_x, u_y = self.csf.step(self.cfg.dt, f_x, f_y)
+        # quantum network
+        self.qnet.lindblad_step(self.cfg.dt, phi, u_x, u_y)
+        # safety & metrics
+        lam_field, divF, curlF = self.guard.lambda0_field(Fx, Fy)
+        psi = self.guard.psi_life(u_x, u_y, phi, curlF)
+        # metrics
+        self.amp = self.guard.pid_update(psi, self.amp)
+        pur = self.qnet.mean_purity()
+        ent = self.qnet.mean_entropy()
+        lam_mean = float(np.mean(lam_field))
+        coh = cross_coherence(np.mean(u_x + u_y), np.mean(phi))
+        # logs
+        self.purity_hist.append(pur)
+        self.entropy_hist.append(ent)
+        self.lambda_hist.append(lam_mean)
+        self.psi_hist.append(psi)
+        self.coh_hist.append(coh)
+        self.amp_hist.append(self.amp)
+        self.time_axis.append(t)
+        if self.csv_writer and (step_idx % self.cfg.save_every == 0):
+            self.csv_writer.writerow([step_idx , t , pur , ent , lam_mean , psi , coh , self . amp])
+        return phi , u_x , u_y , lam_field , curlF
+
+    def run ( self ):
+        snaps = []
+        t0 = time . time ()
+        for s in range ( self . cfg . steps ):
+            phi , u_x , u_y , lam , curlF = self . step (s )
+            if s % self . cfg . frame_stride == 0:
+                # downsample purity / entropy etc . for animation curves
+                snaps . append ({
+                    "phi": phi . copy () ,
+                    "u_mag": np . sqrt ( u_x **2 + u_y **2) ,
+                    "lam": lam . copy () ,
+                    "curlF": curlF . copy () ,
+                    "pur": self . purity_hist [ -1] ,
+                    "ent": self . entropy_hist [ -1] ,
+                    "lam_mean": self . lambda_hist [ -1] ,
+                    "psi": self . psi_hist [ -1] ,
+                    "amp": self . amp_hist [ -1] ,
+                    "t": self . time_axis [ -1] ,
+                })
+        t1 = time . time ()
+        print (f" Run completed in {t1 -t0 :.2f}s, frames : { len ( snaps )}")
+        return snaps
+
+
+
+# =========================
+# Animation
+# =========================
+def animate_run(cfg: SimConfig, save_path: Optional[str] = None):
+    sim = CIEL2DMax(cfg)
+    snaps = sim.run()
+
+    # Prepare figure
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(2, 4, width_ratios=[1, 1, 1, 1.4], height_ratios=[1, 1], wspace=0.25, hspace=0.25)
+    ax_phi = fig.add_subplot(gs[0, 0])
+    ax_umag = fig.add_subplot(gs[0, 1])
+    ax_lam = fig.add_subplot(gs[1, 0])
+    ax_curl = fig.add_subplot(gs[1, 1])
+    ax_qmaps = fig.add_subplot(gs[:, 2])
+    ax_curv = fig.add_subplot(gs[:, 3])
+
+    im_phi = ax_phi.imshow(snaps[0]["phi"], cmap="viridis", origin="lower", extent=[0, cfg.Lx, 0, cfg.Ly])
+    ax_phi.set_title(r'$\Phi_A$')
+    im_umag = ax_umag.imshow(snaps[0]["u_mag"], cmap="magma", origin="lower", extent=[0, cfg.Lx, 0, cfg.Ly])
+    ax_umag.set_title(r'$|u|$ (CSF)')
+    im_lam = ax_lam.imshow(snaps[0]["lam"], cmap="plasma", origin="lower", extent=[0, cfg.Lx, 0, cfg.Ly])
+    ax_lam.set_title(r'$\Lambda_0$ field')
+    im_curl = ax_curl.imshow(snaps[0]["curlF"], cmap="coolwarm", origin="lower", extent=[0, cfg.Lx, 0, cfg.Ly])
+    ax_curl.set_title(r'$\mathrm{curl}_z\,F$')
+
+    # Quantum maps
+    qNy, qNx = sim.qnet.qNy, sim.qnet.qNx
+    pur_map = sim.qnet.purity_map()
+    im_q = ax_qmaps.imshow(pur_map, cmap="Greens", origin="lower", extent=[0, qNx, 0, qNy], vmin=0.5, vmax=1.0)
+    ax_qmaps.set_title('Quantum Purity Map (coarse)')
+
+    # Curves
+    ax_curv.set_title('Global metrics')
+    line_pur, = ax_curv.plot([], [], label='Purity', color='tab:green')
+    line_ent, = ax_curv.plot([], [], label='Entropy', color='tab:brown')
+    line_lam, = ax_curv.plot([], [], label=r'$\langle \Lambda_0 \rangle$ (norm)', color='tab:purple')
+    line_psi, = ax_curv.plot([], [], label=r'$\Psi_{\mathrm{life}}$', color='tab:orange')
+    line_amp, = ax_curv.plot([], [], label='Forcing Amp', color='tab:blue')
+    ax_curv.set_xlim(0, len(snaps))
+    ax_curv.set_ylim(0, 1.05)
+    ax_curv.legend(loc='lower right')
+
+    # Histories
+    pur_hist, ent_hist, lam_hist, psi_hist, amp_hist = [], [], [], [], []
+
+    def init():
+        im_phi.set_data(snaps[0]["phi"])
+        im_umag.set_data(snaps[0]["u_mag"])
+        im_lam.set_data(snaps[0]["lam"])
+        im_curl.set_data(snaps[0]["curlF"])
+        im_q.set_data(sim.qnet.purity_map())
+        line_pur.set_data([], [])
+        line_ent.set_data([], [])
+        line_lam.set_data([], [])
+        line_psi.set_data([], [])
+        line_amp.set_data([], [])
+        return im_phi, im_umag, im_lam, im_curl, im_q, line_pur, line_ent, line_lam, line_psi, line_amp
+
+    def update(frame):
+        snap = snaps[frame]
+        im_phi.set_data(snap["phi"])
+        im_umag.set_data(snap["u_mag"])
+        im_lam.set_data(snap["lam"])
+        im_curl.set_data(snap["curlF"])
+        im_q.set_data(sim.qnet.purity_map())
+
+        pur_hist.append(snap["pur"])
+        ent_hist.append(snap["ent"])
+        lam_hist.append(snap["lam_mean"])
+        psi_hist.append(snap["psi"])
+        amp_hist.append(snap["amp"])
+
+        x = np.arange(1, len(pur_hist) + 1)
+        line_pur.set_data(x, running_mean(np.array(pur_hist), cfg.downsample_curves))
+        line_ent.set_data(x, running_mean(np.array(ent_hist), cfg.downsample_curves))
+        lam_norm = (np.array(lam_hist) - np.min(lam_hist)) / (np.ptp(lam_hist) + 1e-12)
+        line_lam.set_data(x, running_mean(lam_norm, cfg.downsample_curves))
+        line_psi.set_data(x, running_mean(np.array(psi_hist), cfg.downsample_curves))
+        amp_norm = np.array(amp_hist) / (cfg.ctrl_max_amp + 1e-12)
+        line_amp.set_data(x, running_mean(amp_norm, cfg.downsample_curves))
+        return im_phi, im_umag, im_lam, im_curl, im_q, line_pur, line_ent, line_lam, line_psi, line_amp
+
+    ani = animation.FuncAnimation(fig, update, frames=len(snaps), init_func=init, blit=False, interval=40)
+
+    if save_path:
+        try:
+            ani.save(save_path, writer='ffmpeg', dpi=120)
+        except Exception:
+            print("FFMPEG not available; showing interactive animation instead.")
+
+    plt.show()
+
+# =========================
+# Entry
+# =========================
+if __name__ == "__main__":
+    cfg = SimConfig(
+        Nx=160, Ny=160, Lx=0.02, Ly=0.02, bc="periodic",
+        dt=1e-6, steps=12000, save_every=20,
+        tau_A=0.015, ell_A=0.0012, sigma_A=3e-4, OU_tau=0.003, OU_gain=1.0,
+        D_F=8e-4, omega_F=5.0, sigma_F=1.5e-4,
+        rho_csf=1000.0, gamma_csf=1.0, eta_csf=0.04, kappa_csf=0.0,
+        force_amp_base=8e-4, resp_freq=0.25, card_freq=1.0, resp_phase=0.0, card_phase=np.pi / 3,
+        spatial_gauss_sigma=0.004, gauss_centers=((0.006, 0.006), (0.014, 0.014)),
+        qNx=40, qNy=40, g_A=0.03, g_u=0.06,
+        lindblad_gamma_down=0.02, lindblad_gamma_phi=0.01, lindblad_gamma_up=0.005,
+        J_neighbor=0.01,
+        mu0=4 * np.pi * 1e-7, c=3e8, alpha_res=1.0, beta=0.08,
+        B0=4e-10, rho_med=1000.0, L_char=0.008,
+        w_grad_u=0.35, w_grad_phi=0.35, w_curlF=0.2, w_amp_u=0.05, w_amp_phi=0.05,
+        psi_floor=0.38, pid_kp=0.6, pid_ki=0.1, pid_kd=0.05,
+        ctrl_min_amp=1e-5, ctrl_max_amp=1.5e-3,
+        make_animation=True, frame_stride=12, downsample_curves=5,
+        csv_metrics_path=None, seed=7
+    )
+    animate_run(cfg, save_path="ciel2d_max.mp4")  # Set e.g. "ciel2d_max.mp4" to save
